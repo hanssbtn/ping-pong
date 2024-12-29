@@ -1,54 +1,64 @@
+#include <Arduino.h>
+#include <Wire.h>
 #include <esp_wifi.h>
-#include <esp_wifi_types.h>
-#include <esp32/rom/gpio.h>
-#include <driver/gpio.h>
-#include <esp_err.h>
-#include <esp_log.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/semphr.h>
 #include <esp_now.h>
-#include <nvs_flash.h>
-#include <esp_system.h>
-#include <esp_event_base.h>
-#include <esp_mac.h>
-#include <esp_netif.h>
-#include <esp_wifi_netif.h>
-#include <esp_event.h>
-#include <esp_crc.h>
+#include <WiFi.h>
 #include <cstring>
+#include <client.h>
+#include <esp_pm.h>
 
 char buf[100] = {};
 
-void recv_callback(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
-    std::memcpy(buf, reinterpret_cast<const char*>(data), len);
-    ESP_LOGI("recv_callback", "got data %s\n", buf);
+bool should_update_server = false;
+bool goal = false;
+
+void send_callback(const uint8_t *mac_addr, esp_now_send_status_t status) {
+    if (status == esp_now_send_status_t::ESP_NOW_SEND_SUCCESS) {
+        should_update_server = false;
+    }
 }
 
-esp_now_peer_info_t peer_info = {
-    .peer_addr = {0xF8, 0xB3,0xB7,0x45,0x4E,0xAC},
-    .channel = 1,
-    .ifidx = WIFI_IF_STA,
-    .encrypt = false,
-};
+void recv_callback(const uint8_t *mac_addr, const uint8_t *data, int len) {
+    std::memcpy(buf, reinterpret_cast<const char*>(data), len);
+    digitalWrite(18, HIGH);
+    Serial.printf("got data %s\n", buf);
+}
 
-void app_main() {
-    auto ret = ESP_ERROR_CHECK_WITHOUT_ABORT(nvs_flash_init());
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK( nvs_flash_erase() );
-        ESP_ERROR_CHECK(nvs_flash_init());
+void listen_goal(bool should) {
+    if (should) {
+        // Turn on sensor 
+        return;
     }
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE));
+    
+}
+
+void setup() {
+    Serial.begin(115200);   
+    WiFi.mode(WIFI_STA);
     ESP_ERROR_CHECK(esp_now_init());
-    ESP_ERROR_CHECK(esp_now_add_peer(&peer_info));
-    ESP_ERROR_CHECK(esp_now_register_recv_cb(recv_callback));
-    ESP_ERROR_CHECK(esp_wifi_set_protocol(wifi_interface_t::WIFI_IF_STA, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N|WIFI_PROTOCOL_LR) );
-    while (true) {
-        if (*buf) {
-            ESP_LOGI("recv_data", "got data %s\n", buf);
-            break;
-        }
+    esp_now_add_peer(&server_info);
+    esp_now_register_send_cb(esp_now_send_cb_t(send_callback));
+    esp_now_register_recv_cb(esp_now_recv_cb_t(recv_callback));
+    #ifdef ENABLE
+    esp_sleep_enable_wifi_wakeup();
+    esp_pm_config_esp32_t pm_cfg;
+    esp_pm_get_configuration(&pm_cfg);
+    pm_cfg.light_sleep_enable = true;
+    esp_pm_configure(&pm_cfg);
+    #endif
+    listen_goal(true);
+}
+
+void loop() {
+    if (goal) {
+        should_update_server = true;
+        listen_goal(false);
     }
+    while (should_update_server) {
+        esp_now_send(nullptr, reinterpret_cast<const uint8_t*>("G"), 1ULL);
+        delayMicroseconds(200);
+    }
+    Serial.printf("data: %s\n", buf);
+    delay(1000);
+    //
 }
