@@ -4,10 +4,16 @@
 #include <esp_now.h>
 #include <WiFi.h>
 #include <cstring>
-#include <client.h>
 #include <esp_pm.h>
 
 char buf[100] = {};
+
+static const esp_now_peer_info_t server_info = {
+    .peer_addr = {0xF8, 0xB3, 0xB7, 0x45, 0x4E, 0xAC},
+    .channel = 1,
+    .ifidx = WIFI_IF_STA,
+    .encrypt = false,
+};
 
 bool should_update_server = false;
 bool goal = false;
