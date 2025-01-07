@@ -1,9 +1,9 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <ArduinoJson.h> // Include the ArduinoJson library
+#include <ArduinoJson.h>
 
-const char* ssid = "your_wifi_ssid";       // Replace with your Wi-Fi SSID
-const char* password = "your_wifi_password"; // Replace with your Wi-Fi password
+const char* ssid = "your_wifi_ssid";       // Replace with Wi-Fi SSID
+const char* password = "your_wifi_password"; // Replace with Wi-Fi password
 const char* wled_ip = "192.168.1.100";    // Replace with the WLED device's IP address
 
 void setup() {
