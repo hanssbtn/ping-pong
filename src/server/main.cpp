@@ -2,94 +2,122 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 
-const char* ssid = "your_wifi_ssid";       // Replace with Wi-Fi SSID
-const char* password = "your_wifi_password"; // Replace with Wi-Fi password
-const char* wled_ip = "192.168.1.100";    // Replace with the WLED device's IP address
+int LEDpins[] = {4, 5, 16}; // Change according to GPIO pins used
+int numLEDs = sizeof(LEDpins) / sizeof(*LEDpins);
 
 void setup() {
-  Serial.begin(115200);
-
-  // Connect to Wi-Fi
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
-    Serial.println("Connecting to WiFi...");
-  }
-  Serial.println("Connected to WiFi!");
-}
-
-// Function to send commands to WLED
-void triggerWLED(bool power, int effect = -1, int brightness = -1, uint8_t r = 0, uint8_t g = 0, uint8_t b = 0) {
-  HTTPClient http;
-  String url = "http://" + String(wled_ip) + "/json/state";
-
-  // Create a JSON object
-  StaticJsonDocument<256> doc;
-
-  // Add common properties
-  doc["on"] = power; // Power state (true = on, false = off)
-
-  // Optional: Add effect, if provided
-  if (effect >= 0) {
-    JsonArray seg = doc.createNestedArray("seg");
-    JsonObject segment = seg.createNestedObject();
-    segment["id"] = 0;   // Segment ID
-    segment["fx"] = effect; // Effect ID
-  }
-
-  // Optional: Add brightness, if provided
-  if (brightness >= 0) {
-    doc["bri"] = brightness; // Brightness value (0-255)
-  }
-
-  // Optional: Add color, if provided
-  if (r > 0 || g > 0 || b > 0) {
-    JsonArray seg = doc["seg"]; // Access existing segment
-    if (seg.size() == 0) {
-      JsonObject segment = seg.createNestedObject();
-      segment["id"] = 0; // Ensure a segment exists
+    Serial.begin(115200);
+    Serial.println("Starting LED Blinking...");
+    for (int i = 0; i < numLEDs; i++) {
+        pinMode(LEDpins[i], OUTPUT);
+        Serial.print("Setting pin ");
+        Serial.print(LEDpins[i]);
+        Serial.println(" as OUTPUT");
     }
-    JsonArray color = seg[0].createNestedArray("col");
-    JsonArray primaryColor = color.createNestedArray();
-    primaryColor.add(r); // Red
-    primaryColor.add(g); // Green
-    primaryColor.add(b); // Blue
-  }
-
-  // Serialize JSON to a string
-  String json_payload;
-  serializeJson(doc, json_payload);
-
-  // Send the HTTP POST request
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  int httpResponseCode = http.POST(json_payload);
-
-  // Handle the response
-  if (httpResponseCode > 0) {
-    Serial.printf("HTTP Response code: %d\n", httpResponseCode);
-  } else {
-    Serial.printf("Error code: %s\n", http.errorToString(httpResponseCode).c_str());
-  }
-
-  http.end();
+    randomSeed(analogRead(0)); // Initializes the random number generator seed by reading in the noise obtained from pin 0.
 }
 
 void loop() {
-  // Example: Turn on the LED strip with a red color
-  triggerWLED(true, -1, 128, 255, 0, 0);
-  delay(5000);
+    int randomLED = random(0, numLEDs); // Chooses a number from 0 until (number of LEDs present - 1)
+    Serial.print("Turning on LED at pin: ");
+    Serial.println(LEDpins[randomLED]);
 
-  // Example: Set a rainbow effect
-  triggerWLED(true, 3); // Effect 3 = Rainbow
-  delay(5000);
-
-  // Example: Turn off the LED strip
-  triggerWLED(false);
-  delay(5000);
+    digitalWrite(LEDpins[randomLED], HIGH); // Turn on the LED
+    delay(500);
+    digitalWrite(LEDpins[randomLED], LOW); // Turn off the LED
+    delay(500);
 }
 
+// --------------------------------------------------------------
 
+// const char* ssid = "your_wifi_ssid";       // Replace with Wi-Fi SSID
+// const char* password = "your_wifi_password"; // Replace with Wi-Fi password
+// const char* wled_ip = "192.168.1.100";    // Replace with the WLED device's IP address
+
+// void setup() {
+//   Serial.begin(115200);
+
+//   // Connect to Wi-Fi
+//   WiFi.begin(ssid, password);
+//   while (WiFi.status() != WL_CONNECTED) {
+//     delay(1000);
+//     Serial.println("Connecting to WiFi...");
+//   }
+//   Serial.println("Connected to WiFi!");
+// }
+
+// // Function to send commands to WLED
+// void triggerWLED(bool power, int effect = -1, int brightness = -1, uint8_t r = 0, uint8_t g = 0, uint8_t b = 0) {
+//   HTTPClient http;
+//   String url = "http://" + String(wled_ip) + "/json/state";
+
+//   // Create a JSON object
+//   StaticJsonDocument<256> doc;
+
+//   // Add common properties
+//   doc["on"] = power; // Power state (true = on, false = off)
+
+//   // Optional: Add effect, if provided
+//   if (effect >= 0) {
+//     JsonArray seg = doc.createNestedArray("seg");
+//     JsonObject segment = seg.createNestedObject();
+//     segment["id"] = 0;   // Segment ID
+//     segment["fx"] = effect; // Effect ID
+//   }
+
+//   // Optional: Add brightness, if provided
+//   if (brightness >= 0) {
+//     doc["bri"] = brightness; // Brightness value (0-255)
+//   }
+
+//   // Optional: Add color, if provided
+//   if (r > 0 || g > 0 || b > 0) {
+//     JsonArray seg = doc["seg"]; // Access existing segment
+//     if (seg.size() == 0) {
+//       JsonObject segment = seg.createNestedObject();
+//       segment["id"] = 0; // Ensure a segment exists
+//     }
+//     JsonArray color = seg[0].createNestedArray("col");
+//     JsonArray primaryColor = color.createNestedArray();
+//     primaryColor.add(r); // Red
+//     primaryColor.add(g); // Green
+//     primaryColor.add(b); // Blue
+//   }
+
+//   // Serialize JSON to a string
+//   String json_payload;
+//   serializeJson(doc, json_payload);
+
+//   // Send the HTTP POST request
+//   http.begin(url);
+//   http.addHeader("Content-Type", "application/json");
+//   int httpResponseCode = http.POST(json_payload);
+
+//   // Handle the response
+//   if (httpResponseCode > 0) {
+//     Serial.printf("HTTP Response code: %d\n", httpResponseCode);
+//   } else {
+//     Serial.printf("Error code: %s\n", http.errorToString(httpResponseCode).c_str());
+//   }
+
+//   http.end();
+// }
+
+// void loop() {
+//   // Example: Turn on the LED strip with a red color
+//   triggerWLED(true, -1, 128, 255, 0, 0);
+//   delay(5000);
+
+//   // Example: Set a rainbow effect
+//   triggerWLED(true, 3); // Effect 3 = Rainbow
+//   delay(5000);
+
+//   // Example: Turn off the LED strip
+//   triggerWLED(false);
+//   delay(5000);
+// }
+
+// ---------------------------------------------------
 
 
 // #include <Arduino.h>
