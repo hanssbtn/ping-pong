@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.16.0)
+string(TOLOWER ${CURRENT_ENV} CURRENT_ENV)
+set(ENV{CURR_ENV} "${CURRENT_ENV}")
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(ping-pong)
