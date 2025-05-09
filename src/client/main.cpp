@@ -3,13 +3,15 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/FreeRTOSConfig.h>
 #include <Arduino.h>
-#include <Wire.h>
 #include <esp_now.h>
+#include <LiquidCrystal_I2C.h>
 #include <WiFi.h>
 #include <cstring>
+#include <Wire.h>
 #include <esp_pm.h>
 #include <esp32-hal-log.h>
-#include <esp32-hal-adc.h>
+
+#include <LiquidCrystal_I2C.h>
 
 #ifdef DEBUG
 #include <esp_gdbstub.h>
@@ -22,213 +24,304 @@
 #pragma message("using CONFIG_ESP_SYSTEM_PANIC_REBOOT option")
 #endif
 
-#define TEST
-#pragma message("Building TEST mode")
+#define SDA_PIN 21
+#define SCL_PIN 22
+#define LED_PIN 2 // Example pin for visual feedback
+#define SOUND_SENSOR_PIN 35 // Update with actual pin
+#define IF_SENSOR_PIN 25 // Update with actual pin
 
-// TODO: add actual pin number
-#define LED_PIN 2
-#define VIBRATION_SENSOR_PIN 3
-#define IF_SENSOR_PIN 4
-#define QUEUE_LEN 64
+// Define how close in time sensor events must be (milliseconds)
+#define STALE_DATA_THRESHOLD_MS 500U // e.g., events must be within 0.5 seconds
+#define SOUND_THRESHOLD 10 
+#define ACCELEROMETER_THRESHOLD 10 
 
-char buf[100] = {};
-const uint8_t *data = (const uint8_t*)"123";
+#define SEND_TAG "SEND"
+#define RECV_TAG "RECV"
+#define LOOP_TAG "LOOP"
+#define SETUP_TAG "SETUP"
+#define SERVER_TAG "SERVER"
+#define SENSOR_TAG "SENSOR"
+#define PACKET_TAG "PACKET"
 
+// Data to send back to server on success
+const uint8_t RESPONSE_DATA[] = {'A'};
+const size_t RESPONSE_DATA_LEN = sizeof(RESPONSE_DATA);
+
+// Server Info (Update MAC Address if needed)
 const esp_now_peer_info_t server_info = {
-    .peer_addr = {0xF8, 0xB3, 0xB7, 0x45, 0x4E, 0xAC},
-    .lmk = {},
+    .peer_addr = {0xF8,0xB3, 0xB7, 0x45, 0x6A, 0xDC}, 
     .channel = 1,
     .ifidx = WIFI_IF_STA,
     .encrypt = false,
-    .priv = NULL
 };
 
-bool should_update_server = false;
-bool goal = false;
-QueueHandle_t table_queue = NULL, goal_queue = NULL;
+// --- Global Variables for Sensor State ---
+volatile bool vibration_triggered = false;
+volatile uint32_t last_vibration_time = 0;
 
+volatile bool ir_triggered = false;
+volatile uint32_t last_ir_time = 0;
+
+// Flag to signal the send task
+volatile bool ready_to_send_response = false;
+
+// Buffer for receiving messages from server
+char recv_buf[100] = {};
+
+LiquidCrystal_I2C lcd(0x27, 20, 4); 
+
+void read_sensor_task(void *param) {
+    ESP_LOGI("READ", "Sensor Reading Task Started.");
+
+    int adc_value;
+
+    while (1) {
+        // --- Read ADC ---
+        adc_value = analogRead(SOUND_SENSOR_PIN);
+        ESP_LOGI("MIC", "ADC Value (Pin %d): %d", SOUND_SENSOR_PIN, adc_value); // Uncomment for detailed logging
+		if (adc_value >= SOUND_THRESHOLD) {
+			last_ir_time = millis();
+			ir_triggered = true;
+		}
+
+        // Delay before next reading cycle
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+void IRAM_ATTR ir_isr() {
+    last_ir_time = millis();
+    ir_triggered = true;
+    // NOTE: Consider debouncing if needed.
+}
+
+// --- ESP-NOW Callbacks ---
 void send_callback(const uint8_t *mac_addr, esp_now_send_status_t status) {
-    should_update_server = status != esp_now_send_status_t::ESP_NOW_SEND_SUCCESS;
-    log_i("should_update_server [%p]: %d\n", &should_update_server, should_update_server);
+    if (status == ESP_NOW_SEND_SUCCESS) {
+        ESP_LOGI(SEND_TAG, "--> Response Sent OK to Server");
+    } else {
+        ESP_LOGW(SEND_TAG, "--> Response Send FAILED to Server");
+		ready_to_send_response = true;
+    }
 }
 
 void recv_callback(const uint8_t *mac_addr, const uint8_t *data, int len) {
-    std::memcpy(buf, reinterpret_cast<const char*>(data), len);
-    digitalWrite(18, HIGH);
-    log_i("got data %s\n", buf);
+    // Safely copy received data
+    size_t len_to_copy = (len < sizeof(recv_buf)) ? len : sizeof(recv_buf) - 1;
+    std::memcpy(recv_buf, reinterpret_cast<const char*>(data), len_to_copy);
+    recv_buf[len_to_copy] = '\0'; // Null-terminate
+
+    ESP_LOGI(RECV_TAG, "<-- Recv %d bytes from Server: '%s'", len, recv_buf);
+    digitalWrite(LED_PIN, HIGH); // Turn on LED briefly on receive
+    delay(50); // Keep LED on shortly
+    digitalWrite(LED_PIN, LOW);
+
+    // Use the received message content (e.g., "W") to reset state if needed
+    // For now, receiving anything just logs it. The sensor logic runs independently.
 }
 
-void listen_goal(void *param) {
-    uint8_t res = 0;
-    uint8_t a = 0;
+
+// --- FreeRTOS Tasks ---
+
+// Task to check sensor flags and timestamps
+void sensor_logic_task(void *param) {
+    bool local_vibration_triggered;
+    uint32_t local_last_vibration_time;
+    bool local_ir_triggered;
+    uint32_t local_last_ir_time;
+
+    ESP_LOGI(SENSOR_TAG, "Sensor Logic Task Started. Waiting for sensor events...");
+
     while (1) {
-        log_i("queue: %p\n", table_queue);
-        auto k = xQueueReceive(table_queue, &res, portMAX_DELAY);
-        if (k) {
-            log_i("received %c\n", res);
-            auto start_cycle = cpu_ll_get_cycle_count();
-            log_i("a: %p\n", &a);
-            log_i("res: %p\n", &res);
-            res = 0;
-            // Try to read IF sensor for 100 microseconds.
-            while (cpu_ll_get_cycle_count() - start_cycle < microsecondsToClockCycles(100)) {
-                log_i("%u\n", cpu_ll_get_cycle_count() - start_cycle);
-                if (digitalRead(IF_SENSOR_PIN)) {
-                    res = 1;
-                    break;
-                }
+		// Atomically read volatile variables (often safe for bool/ulong on ESP32,
+        // but critical sections are safer if strict atomicity is required)
+        local_vibration_triggered = vibration_triggered;
+        local_last_vibration_time = last_vibration_time;
+        local_ir_triggered = ir_triggered;
+        local_last_ir_time = last_ir_time;
+		ESP_LOGI(SENSOR_TAG, "local_vibration_triggered: %d", local_vibration_triggered);
+		ESP_LOGI(SENSOR_TAG, "local_ir_triggered: %d", local_ir_triggered);
+		ESP_LOGI(SENSOR_TAG, "local_last_vibration_time: %d ms", local_last_vibration_time);
+		ESP_LOGI(SENSOR_TAG, "local_last_ir_time: %d ms", local_last_ir_time);
+
+        if (local_vibration_triggered && local_ir_triggered) {
+            // Both sensors have been triggered *at some point*
+
+            // Check if timestamps are within the allowed threshold (not stale)
+            uint32_t time_diff;
+            if (local_last_vibration_time >= local_last_ir_time) {
+                time_diff = local_last_vibration_time - local_last_ir_time;
+            } else {
+                time_diff = local_last_ir_time - local_last_vibration_time;
             }
-            #ifdef TEST
-            auto l = esp_random();
-            res = (uint8_t)l & 1;
-            log_i("received %d\n", res);
-            #endif
-            if (res) {
-                char msg = 'G';
-                auto x = xQueueSend(goal_queue, &msg, portMAX_DELAY);
-                log_i("got %d\n", x);
+
+			lcd.setCursor(0,0);
+            if (time_diff <= STALE_DATA_THRESHOLD_MS) {
+                // **** Valid Detection: Both sensors triggered recently ****
+                ESP_LOGI(SENSOR_TAG, "VALID EVENT: Vibration and IR detected within %u ms (Diff: %u ms)",
+                       STALE_DATA_THRESHOLD_MS, time_diff);
+				lcd.print("Goal!");
+				ready_to_send_response = true;
+            } else {
+                // Stale Data: Events happened too far apart
+                ESP_LOGW(SENSOR_TAG, "STALE EVENT: Vibration and IR detected but too far apart (Diff: %u ms > %u ms)",
+                       time_diff, STALE_DATA_THRESHOLD_MS);
+				lcd.print("Timeout!");
             }
-            log_i("Finished sending.\n");
+			lcd.setCursor(1,0);
+			lcd.printf("Time required: %u ms", time_diff);
+			vibration_triggered = false;
+			ir_triggered = false;
         }
-        log_i("Finished.\n");
-        log_i("stack bytes remaining: %u bytes\n", uxTaskGetStackHighWaterMark(NULL));
-        vTaskDelay(1);
+        // If only one or none triggered, do nothing and wait
+
+        // Delay to prevent busy-waiting and allow other tasks
+        vTaskDelay(pdMS_TO_TICKS(20)); // Check roughly 50 times per second
     }
 }
 
-void listen_table(void *param) {
-    const char msg = 'T';
-    uint8_t res;
+// Task to send ESP-NOW packet when signaled
+void send_packet_task(void *param) {
+    ESP_LOGI(PACKET_TAG, "Send Packet Task Started.");
+	
     while (1) {
-        res = 0;
-        // Try to read vibration sensor for 100 microseconds.
-        auto start_cycle = cpu_ll_get_cycle_count();
-        while (cpu_ll_get_cycle_count() - start_cycle < microsecondsToClockCycles(100)) {
-            log_i("%u\n", cpu_ll_get_cycle_count() - start_cycle);
-            if (digitalRead(VIBRATION_SENSOR_PIN)) {
-                res = 1;
-                break;
+        if (ready_to_send_response) {
+            ESP_LOGI(PACKET_TAG, ">>> Detected signal to send response to server.");
+
+            // Reset the flag immediately before sending
+            ready_to_send_response = false;
+
+            // Send the predefined response data
+            esp_err_t result = esp_now_send(server_info.peer_addr, RESPONSE_DATA, RESPONSE_DATA_LEN);
+
+            if (result == ESP_OK) {
+                ESP_LOGI(PACKET_TAG, "ESP-NOW send initiated successfully.");
+            } else {
+                log_e("ESP-NOW send initiation failed: %s", esp_err_to_name(result));
+                // Optional: Handle failure (e.g., set ready_to_send_response = true to retry?)
+				ready_to_send_response = true;
             }
+             // Add a delay after sending to prevent immediate re-triggering if needed
+            vTaskDelay(pdMS_TO_TICKS(100));
+
+        } else {
+            // Nothing to send, wait politely
+            vTaskDelay(pdMS_TO_TICKS(50));
         }
-        #ifdef TEST
-        auto k = esp_random();
-        res = (uint8_t)k & 1;
-        #endif
-        if (res) {
-            log_i("queue: %p\n", table_queue);
-            auto x = xQueueSend(table_queue, &msg, portMAX_DELAY);
-            auto u = uxQueueSpacesAvailable(table_queue);
-            log_i("got %d, space remaining: %u\n", x, u);
-        }
-        auto u =  uxQueueMessagesWaiting(table_queue);
-        log_i("table: %u messages waiting.\n", u);
-        u = uxQueueMessagesWaiting(goal_queue);
-        log_i("goal: %u messages waiting.\n", u);
-        log_i("stack bytes remaining: %u bytes\n", uxTaskGetStackHighWaterMark(NULL));
-        vTaskDelay(1);
     }
 }
 
-void send_packet(void *param) {
-    uint8_t res = 0;
-    while (1) {
-        uint8_t a = 0;
-        log_i("%u messages waiting.\n", uxQueueMessagesWaiting(goal_queue));
-        log_i("goal_queue: %p\n", goal_queue);
-        if ((a = xQueuePeek(goal_queue, &res, portMAX_DELAY))) {
-            esp_now_send(server_info.peer_addr, data, strlen("123"));
-            #ifdef TEST
-            log_i("a: %p\n", &a);
-            log_i("res: %p\n", &res);
-            log_i("data: %p\n", data);
-            log_i("got %c\n", res);
-            log_i("goal_queue: %p", goal_queue);
-            auto u = uxQueueSpacesAvailable(goal_queue);
-            log_i("%u goal queue bytes remaining\n", u);
-            auto x = xQueueReceive(goal_queue, &res, 0);
-            log_i("received data: %d\n", x);
-            #endif
-            if (!should_update_server) {
-                auto x = xQueueReceive(goal_queue, &res, 0);
-            }
-            log_i("Finished sending.\n");
-        }
-        log_i("a: %d, Finished.\n", a);
-        log_i("stack bytes remaining: %u bytes\n", uxTaskGetStackHighWaterMark(NULL));
-        vTaskDelay(1);
-    }
+void dummy_send_task(void *param) {
+	ESP_LOGI("DUMMY", "send data task started.");
+
+	while (1) {
+		esp_err_t result = esp_now_send(server_info.peer_addr, RESPONSE_DATA, RESPONSE_DATA_LEN);
+
+		if (result == ESP_OK) {
+			ESP_LOGI(PACKET_TAG, "ESP-NOW send initiated successfully.");
+		} else {
+			log_e("ESP-NOW send initiation failed: %s", esp_err_to_name(result));
+			// Optional: Handle failure (e.g., set ready_to_send_response = true to retry?)
+			ready_to_send_response = true;
+		}
+		 // Add a delay after sending to prevent immediate re-triggering if needed
+		vTaskDelay(pdMS_TO_TICKS(100));
+	}
 }
 
 void setup() {
     Serial.begin(115200);
-    WiFi.mode(WIFI_STA);
-    #ifdef DEBUG
-    esp_gdbstub_init();
-    #endif
-    pinMode(IF_SENSOR_PIN, INPUT);
+	
+	ESP_LOGI(SETUP_TAG, "Client Setup Started...");
+    WiFi.mode(wifi_mode_t::WIFI_MODE_STA);
+    ESP_LOGI(SETUP_TAG, "Client WiFi MAC: %s", WiFi.macAddress().c_str()); // Log client MAC
+
+	// Initialize ESP-NOW
+	ESP_ERROR_CHECK(esp_now_init());
+	ESP_ERROR_CHECK(esp_now_register_send_cb(send_callback));
+	ESP_ERROR_CHECK(esp_now_register_recv_cb(recv_callback));
+	
+	// Add server peer
+	esp_err_t addStatus = esp_now_add_peer(&server_info);
+	if (addStatus == ESP_OK) {
+		ESP_LOGI(SETUP_TAG, "Server peer added successfully");
+	} else {
+		ESP_LOGE(SETUP_TAG, "Failed to add server peer, error: %s", esp_err_to_name(addStatus));
+	}
+	
+	xTaskCreatePinnedToCore(dummy_send_task, "dummy_send_task", 4096, NULL, 1, NULL, 0);
+	return;
+
+	Wire.begin(SDA_PIN, SCL_PIN); // Initialize I2C bus (SDA, SCL)
+	// Initialize LCD
+	lcd.init();
+	lcd.backlight();
+	lcd.clear();
+	ESP_LOGI(SETUP_TAG, "LCD Initialized.");
+
+    // Initialize GPIOs
     pinMode(LED_PIN, OUTPUT);
-    pinMode(VIBRATION_SENSOR_PIN, INPUT);
-    ESP_ERROR_CHECK(esp_now_init());
-    ESP_ERROR_CHECK(esp_now_add_peer(&server_info));
-    ESP_ERROR_CHECK(esp_now_register_send_cb(esp_now_send_cb_t(send_callback)));
-    ESP_ERROR_CHECK(esp_now_register_recv_cb(esp_now_recv_cb_t(recv_callback)));
+    digitalWrite(LED_PIN, LOW); // Start with LED off
+
+    // --- Configure Sensor Pins and Interrupts ---
+    // IMPORTANT: Adjust INPUT_PULLUP/INPUT_PULLDOWN/INPUT based on your sensor wiring.
+    // If your sensor outputs HIGH when active and has no pull-down, use INPUT_PULLDOWN.
+    // If it outputs LOW when active and has no pull-up, use INPUT_PULLUP.
+    pinMode(SOUND_SENSOR_PIN, INPUT); // Example: Assume sensor pulls LOW when active
+    pinMode(IF_SENSOR_PIN, INPUT); // Example: Assume sensor pulls LOW when active
+
+    // Attach Interrupts
+    attachInterrupt(digitalPinToInterrupt(IF_SENSOR_PIN), ir_isr, RISING); 
+	
+    ESP_LOGI(SETUP_TAG, "Interrupts attached to pins %d and %d", SOUND_SENSOR_PIN, IF_SENSOR_PIN);
+    // --- End Sensor Config ---
+
+    // Optional: Power Management / Sleep Config (if needed for client)
     #ifdef ENABLE_SLEEP
-    ESP_ERROR_CHECK(esp_sleep_enable_wifi_wakeup());
-    esp_pm_config_esp32_t pm_cfg;
-    ESP_ERROR_CHECK(esp_pm_get_configuration(&pm_cfg));
-    pm_cfg.light_sleep_enable = true;
-    ESP_ERROR_CHECK(esp_pm_configure(&pm_cfg));
+    // ESP_ERROR_CHECK(esp_sleep_enable_wifi_wakeup()); // If server wakes client
+    // esp_pm_config_esp32_t pm_cfg;
+    // ... configure light sleep ...
     #endif
 
-    table_queue = xQueueCreate(QUEUE_LEN, (sizeof(char)));
-    if (!table_queue) {
-        log_e("Failed to allocate memory for table_queue.\n");
-        abort();
+	lcd.setCursor(0, 0);
+	lcd.print("Game Starting in 3...");
+	vTaskDelay(pdMS_TO_TICKS(1000));
+	lcd.setCursor(0, 0);
+	lcd.print("Game Starting in 2...");
+	vTaskDelay(pdMS_TO_TICKS(1000));
+	lcd.setCursor(0, 0);
+	lcd.print("Game Starting in 1...");
+	vTaskDelay(pdMS_TO_TICKS(1000));
+	lcd.clear();
+	lcd.setCursor(0, 0);
+	lcd.print("Start!");
+	vTaskDelay(pdMS_TO_TICKS(1000));
+	lcd.clear();
+
+	ESP_LOGI(SETUP_TAG, "Creating tasks...");
+    if (xTaskCreatePinnedToCore(sensor_logic_task, "sensor_logic", 4096, NULL, 1, NULL, 0)) { // Core 0
+        ESP_LOGE(SETUP_TAG, "Failed to create Sensor Logic Task");
+        while(1) {
+			vTaskDelay(1);
+		};
     }
-    goal_queue = xQueueCreate(QUEUE_LEN, (sizeof(char)));
-    if (!goal_queue) {
-        log_e("Failed to allocate memory for goal_queue.\n");
-        abort();
+	if (xTaskCreatePinnedToCore(read_sensor_task, "read_sensor", 4096, NULL, 1, NULL, 0)) { // Core 0
+		ESP_LOGE(SETUP_TAG, "Failed to create Read Sensor Task");
+		while(1) {
+			vTaskDelay(1);
+		};
+	}
+	if (xTaskCreatePinnedToCore(send_packet_task, "send_packet", 4096, NULL, 1, NULL, 1)) { // Core 1
+        ESP_LOGE(SETUP_TAG, "Failed to create Send Packet Task");
+        while(1) {
+			vTaskDelay(1);
+		};
     }
-    if (xTaskCreatePinnedToCore(
-        listen_table,
-        "listen_table",
-        4096,
-        NULL,
-        0,
-        NULL,
-        1
-    ) == errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY) {
-        log_e("Failed to allocate memory for %s task.\n", "listen_table");
-        abort();
-    };
-    if (xTaskCreatePinnedToCore(
-        listen_goal,
-        "listen_goal",
-        4096,
-        NULL,
-        0,
-        NULL,
-        0
-    ) == errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY) {
-        log_e("Failed to allocate memory for %s task.\n", "listen_goal");
-        abort();
-    };
-    if (xTaskCreatePinnedToCore(
-        send_packet,
-        "send_packet",
-        4096,
-        NULL,
-        0,
-        NULL,
-        1
-    ) == errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY) {
-        log_e("Failed to allocate memory for %s task.\n", "send_packet");
-        abort();
-    };
+
+	ESP_LOGI(SETUP_TAG,"Client Setup Finished.");
 }
 
 void loop() {
-    // Delete unused loop task
+    // Delete the default Arduino loopTask as we are using FreeRTOS tasks
     vTaskDelete(NULL);
 }
