@@ -20,7 +20,7 @@
 
 // --- Configuration ---
 const char *WAKEUP_MESSAGE = "W", // Simple message to send to client
-		   *EXPECTED_CLIENT_RESPONSE = "1", // What client sends on success
+		   *EXPECTED_CLIENT_RESPONSE = "A", // What client sends on success
 		   *SERVER_TAG = "SERVER",
 		   *SETUP_TAG = "SETUP",
 		   *SEND_TAG = "SEND",
@@ -34,20 +34,25 @@ char recv_buf[100] = {}; // Renamed buffer for clarity
 // *** FIX: Use UNIQUE MAC addresses for clients ***
 // Replace these with the actual MAC addresses of your client ESP32s
 esp_now_peer_info_t client_infos[] = {
+    // {
+    //
+    //     .peer_addr = {0xF8, 0xB3, 0xB7, 0x45, 0x4E, 0xAC},
+    //     .channel = 1,
+    //     .ifidx = WIFI_IF_STA,
+    //     .encrypt = false
+    // },
     {
-        // MAC from your client code example
-        .peer_addr = {0xF8, 0xB3, 0xB7, 0x45, 0x4E, 0xAC},
+        .peer_addr = {0xF8, 0xB3, 0xB7, 0x45, 0x6A, 0xDC},
         .channel = 1,
         .ifidx = WIFI_IF_STA,
         .encrypt = false
     },
-    // Add second client if applicable
-    {
-        .peer_addr = {0xF8, 0xB3, 0xB7, 0x3F, 0x0B, 0xAC}, // Example Client 2 MAC
-        .channel = 1,
-        .ifidx = WIFI_IF_STA,
-        .encrypt = false
-    }
+    // {
+    //     .peer_addr = {0xF8, 0xB3, 0xB7, 0x3F, 0x0B, 0xAC}, // Example Client 2 MAC
+    //     .channel = 1,
+    //     .ifidx = WIFI_IF_STA,
+    //     .encrypt = false
+    // }
 };
 
 #define NUM_CLIENTS (sizeof(client_infos) / sizeof(client_infos[0]))
