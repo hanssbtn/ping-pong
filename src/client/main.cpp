@@ -77,7 +77,6 @@ const float impactThreshold = 0;  // Adjust based on testing
 const int soundThreshold = 10;    // Adjust based on testing
 
 bool ballTouched = false;
-int playerScore = 0;
 unsigned long ballTouchTime = 0;
 const unsigned long timeout = 1000; 
 
@@ -126,14 +125,16 @@ void IRAM_ATTR ir_isr() {
 void send_callback(const uint8_t *mac_addr, esp_now_send_status_t status) {
     if (status == ESP_NOW_SEND_SUCCESS) {
         ESP_LOGI(SEND_TAG, "--> Response Sent OK to Server");
+		lcd.clear();
+		vTaskDelay(pdMS_TO_TICKS(1000));
 		xSemaphoreTake(mux, portMAX_DELAY);
 		set_led_color(0, 0, 0);
 		xSemaphoreGive(mux);
-		vTaskDelay(pdMS_TO_TICKS(1000));
     } else {
         ESP_LOGW(SEND_TAG, "--> Response Send FAILED to Server");
 		ready_to_send_response = true;
     }
+	vTaskDelay(pdMS_TO_TICKS(100));
 }
 
 void recv_callback(const uint8_t *mac_addr, const uint8_t *data, int len) {
@@ -143,10 +144,11 @@ void recv_callback(const uint8_t *mac_addr, const uint8_t *data, int len) {
     recv_buf[len_to_copy] = '\0'; // Null-terminate
 
     ESP_LOGI(RECV_TAG, "<-- Recv %d bytes from Server: '%s'", len, recv_buf);
-    vTaskDelay(pdMS_TO_TICKS(1000)); // Keep LED on shortly
 	xSemaphoreTake(mux, portMAX_DELAY);
 	set_led_color(200, 0, 200);
 	xSemaphoreGive(mux);
+	game_start();
+	vTaskDelay(pdMS_TO_TICKS(100)); // Keep LED on shortly
 }
 
 // --- FreeRTOS Tasks ---
@@ -184,32 +186,40 @@ void sensor_logic_task(void *param) {
             } else {
                 time_diff = local_last_ir_time - local_last_vibration_time;
             }
-
-			lcd.setCursor(0,0);
+			vibration_triggered = false;
+			ir_triggered = false;
+			lcd.clear();
             if (time_diff <= STALE_DATA_THRESHOLD_MS) {
                 // **** Valid Detection: Both sensors triggered recently ****
                 ESP_LOGI(SENSOR_TAG, "VALID EVENT: Vibration and IR detected within %u ms (Diff: %u ms)",
-                       STALE_DATA_THRESHOLD_MS, time_diff);
+					STALE_DATA_THRESHOLD_MS, time_diff);
 				lcd.print("Goal!");
 				ready_to_send_response = true;
-				// set_led_color(0, 255, 0);
+				xSemaphoreTake(mux, portMAX_DELAY);
+				set_led_color(0, 255, 0);
+				xSemaphoreGive(mux);
+				lcd.setCursor(1, 0);
+				lcd.printf("Time: %u ms", time_diff);
             } else {
                 // Stale Data: Events happened too far apart
                 ESP_LOGW(SENSOR_TAG, "STALE EVENT: Vibration and IR detected but too far apart (Diff: %u ms > %u ms)",
-                       time_diff, STALE_DATA_THRESHOLD_MS);
+				time_diff, STALE_DATA_THRESHOLD_MS);
+				xSemaphoreTake(mux, portMAX_DELAY);
+				set_led_color(255, 0, 0);
+				xSemaphoreGive(mux);
 				lcd.print("Timeout!");
-				// set_led_color(255, 0, 0);
+				lcd.setCursor(1, 0);
+				lcd.printf("Time: %u ms", time_diff);
+				vTaskDelay(pdMS_TO_TICKS(1000));
+				lcd.clear();
+				lcd.print("Waiting...");
             }
-			lcd.setCursor(1,0);
-			lcd.printf("Time required: %u ms", time_diff);
-			vibration_triggered = false;
-			ir_triggered = false;
         }
         // If only one or none triggered, do nothing and wait
 
         // Delay to prevent busy-waiting and allow other tasks
         vTaskDelay(pdMS_TO_TICKS(20)); 
-        // vTaskDelay(pdMS_TO_TICKS(2000)); // Check roughly 50 times per second
+        // vTaskDelay(pdMS_TO_TICKS(2000)); 
     }
 }
 
@@ -247,35 +257,35 @@ void send_packet_task(void *param) {
     }
 }
 
-void dummy_send_task(void *param) {
-	ESP_LOGI("DUMMY", "send data task started.");
-	while (1) {
-		esp_err_t result = esp_now_send(server_info.peer_addr, RESPONSE_DATA, RESPONSE_DATA_LEN);
-		ESP_LOGI(PACKET_TAG, "free heap size: %u bytes\n", esp_get_free_heap_size());
-		ESP_LOGI(PACKET_TAG, "memory used: %u bytes\n", uxTaskGetStackHighWaterMark(NULL));
-		ESP_LOGI(PACKET_TAG, ">>> Detected signal to send response to server.");
-		xSemaphoreTake(mux, portMAX_DELAY);
-		if (result == ESP_OK) {
-			ESP_LOGI(PACKET_TAG, "ESP-NOW send initiated successfully.");
-			set_led_color(0, 255, 0);
-		} else {
-			log_e("ESP-NOW send initiation failed: %s", esp_err_to_name(result));
-			// Optional: Handle failure (e.g., set ready_to_send_response = true to retry?)
-			ready_to_send_response = true;
-			set_led_color(255, 0, 0);
-		}
-		set_led_color(0, 0, 255);
-		vTaskDelay(pdMS_TO_TICKS(1000));
-		set_led_color(0, 255, 0);
-		vTaskDelay(pdMS_TO_TICKS(1000));
-		set_led_color(255, 0, 0);
-		vTaskDelay(pdMS_TO_TICKS(1000));
-		xSemaphoreGive(mux);
-		// Add a delay after sending to prevent immediate re-triggering if needed
-		// vTaskDelay(pdMS_TO_TICKS(100));
-		vTaskDelay(pdMS_TO_TICKS(2000));
-	}
-}
+// void dummy_send_task(void *param) {
+// 	ESP_LOGI("DUMMY", "send data task started.");
+// 	while (1) {
+// 		esp_err_t result = esp_now_send(server_info.peer_addr, RESPONSE_DATA, RESPONSE_DATA_LEN);
+// 		ESP_LOGI(PACKET_TAG, "free heap size: %u bytes\n", esp_get_free_heap_size());
+// 		ESP_LOGI(PACKET_TAG, "memory used: %u bytes\n", uxTaskGetStackHighWaterMark(NULL));
+// 		ESP_LOGI(PACKET_TAG, ">>> Detected signal to send response to server.");
+// 		xSemaphoreTake(mux, portMAX_DELAY);
+// 		if (result == ESP_OK) {
+// 			ESP_LOGI(PACKET_TAG, "ESP-NOW send initiated successfully.");
+// 			set_led_color(0, 255, 0);
+// 		} else {
+// 			log_e("ESP-NOW send initiation failed: %s", esp_err_to_name(result));
+// 			// Optional: Handle failure (e.g., set ready_to_send_response = true to retry?)
+// 			ready_to_send_response = true;
+// 			set_led_color(255, 0, 0);
+// 		}
+// 		set_led_color(0, 0, 255);
+// 		vTaskDelay(pdMS_TO_TICKS(1000));
+// 		set_led_color(0, 255, 0);
+// 		vTaskDelay(pdMS_TO_TICKS(1000));
+// 		set_led_color(255, 0, 0);
+// 		vTaskDelay(pdMS_TO_TICKS(1000));
+// 		xSemaphoreGive(mux);
+// 		// Add a delay after sending to prevent immediate re-triggering if needed
+// 		// vTaskDelay(pdMS_TO_TICKS(100));
+// 		vTaskDelay(pdMS_TO_TICKS(2000));
+// 	}
+// }
 
 void set_led_color(int red, int green, int blue) {
 	for (int i = 0; i < NUM_LEDS; i++) {
@@ -295,26 +305,19 @@ void init_system() {
 }
 
 void game_start() {
-  for (int i = 3; i > 0; i--) {
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Game starts in ");
-    lcd.setCursor(0, 1);
-    lcd.print(i);
-    delay(1000);
-  }
+	for (int i = 3; i > 0; i--) {
+		lcd.clear();
+		lcd.print("Game starts in ");
+		lcd.setCursor(0, 1);
+		lcd.print(i);
+		vTaskDelay(pdMS_TO_TICKS(1000));
+	}
 
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Game Started!");
-  delay(1000);
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Waiting for Ball...");
-  lcd.setCursor(0, 1);
-  lcd.print("Score: ");
-  lcd.print(playerScore);
-  digitalWrite(LED_PIN, HIGH);
+	lcd.clear();
+	lcd.print("Game Started!");
+	vTaskDelay(pdMS_TO_TICKS(1000));
+	lcd.clear();
+	lcd.print("Waiting...");
 }
 
 void setup() {
@@ -371,7 +374,7 @@ void setup() {
     // esp_pm_config_esp32_t pm_cfg;
     // ... configure light sleep ...
     #endif
-	xTaskCreatePinnedToCore(dummy_send_task, "dummy_task", 2048, NULL, 1, NULL, 0);
+	// xTaskCreatePinnedToCore(dummy_send_task, "dummy_task", 2048, NULL, 1, NULL, 0);
 	game_start();
 
 	ESP_LOGI(SETUP_TAG, "Creating tasks...");
