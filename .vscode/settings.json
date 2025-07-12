@@ -13,6 +13,7 @@
 		"random": "cpp",
 		"cstring": "cpp",
 		"deque": "cpp",
-		"vector": "cpp"
+		"vector": "cpp",
+		"atomic": "cpp"
 	}
 }

@@ -1,4 +1,5 @@
 #include <esp_event.h>
+#include <esp32-hal-adc.h>
 #include <freertos/task.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/FreeRTOSConfig.h>
@@ -44,7 +45,6 @@
 #define SENSOR_TAG "SENSOR"
 #define PACKET_TAG "PACKET"
 
-
 // Data to send back to server on success
 const uint8_t RESPONSE_DATA[] = {'A'};
 const size_t RESPONSE_DATA_LEN = sizeof(RESPONSE_DATA);
@@ -58,7 +58,7 @@ const esp_now_peer_info_t server_info = {
 };
 
 // --- Global Variables for Sensor State ---
-volatile bool vibration_triggered = false;
+volatile uint8_t vibration_count = 0;
 volatile uint32_t last_vibration_time = 0;
 
 volatile bool ir_triggered = false;
@@ -70,66 +70,55 @@ volatile bool ready_to_send_response = false;
 // Buffer for receiving messages from server
 char recv_buf[100] = {};
 
-const int soundSensorPin = 35;  // GPIO36 (VP) for analog input
-const int irSensorPin = 25;     // GPIO25 for digital input
-
-const float impactThreshold = 0;  // Adjust based on testing
-const int soundThreshold = 10;    // Adjust based on testing
-
-bool ballTouched = false;
-unsigned long ballTouchTime = 0;
-const unsigned long timeout = 1000; 
-
-bool blinkLed = false;
-unsigned long blinkStartTime = 0;
-const unsigned long blinkDuration = 1000;
-const int blinkInterval = 50;
-bool ledState = false;
-
-bool lastIRState = LOW;
-unsigned long lastDebounceTime = 0;
-const unsigned long debounceDelay = 10;
-
 CRGB leds[NUM_LEDS];
 
 LiquidCrystal_I2C lcd(0x27, 20, 4); 
 
-xSemaphoreHandle mux = NULL;
+xSemaphoreHandle led_mux = NULL, game_start_mux = NULL;
+
+TaskHandle_t sensor_logic_handle = NULL, read_sensor_handle = NULL, send_packet_handle = NULL;
 
 void set_led_color(int red, int green, int blue);
+void game_start(void);
 
 void read_sensor_task(void *param) {
     ESP_LOGI("READ", "Sensor Reading Task Started.");
     int adc_value;
     while (1) {
+		xSemaphoreTake(game_start_mux, portMAX_DELAY);
 		ESP_LOGI("MIC", "free heap size: %u bytes\n", esp_get_free_heap_size());
 		ESP_LOGI("MIC", "memory used: %u bytes\n", uxTaskGetStackHighWaterMark(NULL));
         // --- Read ADC ---
         adc_value = analogRead(SOUND_SENSOR_PIN);
         ESP_LOGI("MIC", "ADC Value (Pin %d): %d", SOUND_SENSOR_PIN, adc_value); // Uncomment for detailed logging
 		if (adc_value >= SOUND_THRESHOLD) {
-			last_ir_time = millis();
-			ir_triggered = true;
+			last_vibration_time = millis();
+			vibration_count++;
 		}
         // Delay before next reading cycle
-        vTaskDelay(pdMS_TO_TICKS(200));
+		xSemaphoreGive(game_start_mux);
+		vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
 
-void IRAM_ATTR ir_isr() {
+void IRAM_ATTR ir_isr(void) {
     last_ir_time = millis();
     ir_triggered = true;
 }
 
 // --- ESP-NOW Callbacks ---
 void send_callback(const uint8_t *mac_addr, esp_now_send_status_t status) {
+	vTaskSuspend(sensor_logic_handle);
+	vTaskSuspend(read_sensor_handle);
+	cli();
     if (status == ESP_NOW_SEND_SUCCESS) {
         ESP_LOGI(SEND_TAG, "--> Response Sent OK to Server");
 		lcd.clear();
 		vTaskDelay(pdMS_TO_TICKS(1000));
-		xSemaphoreTake(mux, portMAX_DELAY);
+		xSemaphoreTake(led_mux, portMAX_DELAY);
 		set_led_color(0, 0, 0);
-		xSemaphoreGive(mux);
+		xSemaphoreGive(led_mux);
+		vTaskSuspend(send_packet_handle);
     } else {
         ESP_LOGW(SEND_TAG, "--> Response Send FAILED to Server");
 		ready_to_send_response = true;
@@ -144,9 +133,9 @@ void recv_callback(const uint8_t *mac_addr, const uint8_t *data, int len) {
     recv_buf[len_to_copy] = '\0'; // Null-terminate
 
     ESP_LOGI(RECV_TAG, "<-- Recv %d bytes from Server: '%s'", len, recv_buf);
-	xSemaphoreTake(mux, portMAX_DELAY);
+	xSemaphoreTake(led_mux, portMAX_DELAY);
 	set_led_color(200, 0, 200);
-	xSemaphoreGive(mux);
+	xSemaphoreGive(led_mux);
 	game_start();
 	vTaskDelay(pdMS_TO_TICKS(100)); // Keep LED on shortly
 }
@@ -155,69 +144,75 @@ void recv_callback(const uint8_t *mac_addr, const uint8_t *data, int len) {
 
 // Task to check sensor flags and timestamps
 void sensor_logic_task(void *param) {
-    bool local_vibration_triggered;
-    uint32_t local_last_vibration_time;
-    bool local_ir_triggered;
-    uint32_t local_last_ir_time;
 
     ESP_LOGI(SENSOR_TAG, "Sensor Logic Task Started. Waiting for sensor events...");
 
     while (1) {
+		xSemaphoreTake(game_start_mux, portMAX_DELAY);
+		cli();
 		ESP_LOGI(SENSOR_TAG, "free heap size: %u bytes\n", esp_get_free_heap_size());
 		ESP_LOGI(SENSOR_TAG, "memory used: %u bytes\n", uxTaskGetStackHighWaterMark(NULL));
 		// Atomically read volatile variables (often safe for bool/ulong on ESP32,
         // but critical sections are safer if strict atomicity is required)
-        local_vibration_triggered = vibration_triggered;
-        local_last_vibration_time = last_vibration_time;
-        local_ir_triggered = ir_triggered;
-        local_last_ir_time = last_ir_time;
-		ESP_LOGI(SENSOR_TAG, "local_vibration_triggered: %d", local_vibration_triggered);
-		ESP_LOGI(SENSOR_TAG, "local_ir_triggered: %d", local_ir_triggered);
-		ESP_LOGI(SENSOR_TAG, "local_last_vibration_time: %d ms", local_last_vibration_time);
-		ESP_LOGI(SENSOR_TAG, "local_last_ir_time: %d ms", local_last_ir_time);
 
-        if (local_vibration_triggered && local_ir_triggered) {
+		ESP_LOGI(SENSOR_TAG, "vibration_count: %d", vibration_count);
+		ESP_LOGI(SENSOR_TAG, "ir_triggered: %d", ir_triggered);
+		ESP_LOGI(SENSOR_TAG, "last_vibration_time: %d ms", last_vibration_time);
+		ESP_LOGI(SENSOR_TAG, "last_ir_time: %d ms", last_ir_time);
+		
+        if (vibration_count && ir_triggered) {
             // Both sensors have been triggered *at some point*
 
             // Check if timestamps are within the allowed threshold (not stale)
-            uint32_t time_diff;
-            if (local_last_vibration_time >= local_last_ir_time) {
-                time_diff = local_last_vibration_time - local_last_ir_time;
-            } else {
-                time_diff = local_last_ir_time - local_last_vibration_time;
-            }
-			vibration_triggered = false;
-			ir_triggered = false;
+            int64_t time_diff;
+			time_diff = last_vibration_time - last_ir_time;
+
 			lcd.clear();
-            if (time_diff <= STALE_DATA_THRESHOLD_MS) {
-                // **** Valid Detection: Both sensors triggered recently ****
-                ESP_LOGI(SENSOR_TAG, "VALID EVENT: Vibration and IR detected within %u ms (Diff: %u ms)",
-					STALE_DATA_THRESHOLD_MS, time_diff);
-				lcd.print("Goal!");
-				ready_to_send_response = true;
-				xSemaphoreTake(mux, portMAX_DELAY);
-				set_led_color(0, 255, 0);
-				xSemaphoreGive(mux);
-				lcd.setCursor(1, 0);
-				lcd.printf("Time: %u ms", time_diff);
-            } else {
+            if (time_diff > STALE_DATA_THRESHOLD_MS) {
                 // Stale Data: Events happened too far apart
-                ESP_LOGW(SENSOR_TAG, "STALE EVENT: Vibration and IR detected but too far apart (Diff: %u ms > %u ms)",
+                ESP_LOGW(SENSOR_TAG, "STALE EVENT: Vibration and IR detected but too far apart (Diff: %lld ms > %u ms)",
 				time_diff, STALE_DATA_THRESHOLD_MS);
-				xSemaphoreTake(mux, portMAX_DELAY);
+				xSemaphoreTake(led_mux, portMAX_DELAY);
 				set_led_color(255, 0, 0);
-				xSemaphoreGive(mux);
+				xSemaphoreGive(led_mux);
 				lcd.print("Timeout!");
 				lcd.setCursor(1, 0);
-				lcd.printf("Time: %u ms", time_diff);
+				lcd.printf("Time: %lld ms", time_diff);
 				vTaskDelay(pdMS_TO_TICKS(1000));
 				lcd.clear();
 				lcd.print("Waiting...");
+            } else if (vibration_count > 1 || time_diff <= 0) {
+				ESP_LOGI(SENSOR_TAG, "VALID EVENT (fault): Vibration and IR detected within %u ms (Diff: %lld ms)",
+					STALE_DATA_THRESHOLD_MS, time_diff);
+				xSemaphoreTake(led_mux, portMAX_DELAY);
+				set_led_color(255, 0, 0);
+				xSemaphoreGive(led_mux);
+				lcd.print("Fault!");
+				lcd.setCursor(1, 0);
+				lcd.printf("Time: %lld ms", time_diff);
+				vTaskDelay(pdMS_TO_TICKS(1000));
+				lcd.clear();
+				lcd.print("Waiting...");
+			} else {
+				// **** Valid Detection: Both sensors triggered recently ****
+                ESP_LOGI(SENSOR_TAG, "VALID EVENT: Vibration and IR detected within %u ms (Diff: %lld ms)",
+					STALE_DATA_THRESHOLD_MS, time_diff);
+				lcd.print("Goal!");
+				ready_to_send_response = true;
+				xSemaphoreTake(led_mux, portMAX_DELAY);
+				set_led_color(0, 255, 0);
+				xSemaphoreGive(led_mux);
+				lcd.setCursor(1, 0);
+				lcd.printf("Time: %lld ms", time_diff);
             }
+
+			vibration_count = 0;
+			ir_triggered = false;
         }
         // If only one or none triggered, do nothing and wait
-
-        // Delay to prevent busy-waiting and allow other tasks
+		// Delay to prevent busy-waiting and allow other tasks
+		sei();
+		xSemaphoreGive(game_start_mux);
         vTaskDelay(pdMS_TO_TICKS(20)); 
         // vTaskDelay(pdMS_TO_TICKS(2000)); 
     }
@@ -229,7 +224,7 @@ void send_packet_task(void *param) {
     while (1) {
 		ESP_LOGI(PACKET_TAG, "free heap size: %u bytes\n", esp_get_free_heap_size());
 		ESP_LOGI(PACKET_TAG, "memory used: %u bytes\n", uxTaskGetStackHighWaterMark(NULL));
-		ESP_LOGI(PACKET_TAG, ">>> Detected signal to send response to server.");
+		ESP_LOGI(PACKET_TAG, "detected signal to send response to server.");
         if (ready_to_send_response) {
 
             // Reset the flag immediately before sending
@@ -241,7 +236,7 @@ void send_packet_task(void *param) {
             if (result == ESP_OK) {
                 ESP_LOGI(PACKET_TAG, "ESP-NOW send initiated successfully.");
             } else {
-                log_e("ESP-NOW send initiation failed: %s", esp_err_to_name(result));
+                ESP_LOGE(PACKET_TAG, "ESP-NOW send initiation failed: %s", esp_err_to_name(result));
                 // Optional: Handle failure (e.g., set ready_to_send_response = true to retry?)
 				ready_to_send_response = true;
             }
@@ -312,18 +307,30 @@ void game_start() {
 		lcd.print(i);
 		vTaskDelay(pdMS_TO_TICKS(1000));
 	}
-
+	
 	lcd.clear();
 	lcd.print("Game Started!");
 	vTaskDelay(pdMS_TO_TICKS(1000));
 	lcd.clear();
+	sei();
+	vTaskResume(sensor_logic_handle);
+	vTaskResume(read_sensor_handle);
+	vTaskResume(send_packet_handle);
+
 	lcd.print("Waiting...");
 }
 
 void setup() {
     Serial.begin(115200);
-	mux = xSemaphoreCreateMutex();
-	if (!mux) {
+	led_mux = xSemaphoreCreateMutex();
+	if (!led_mux) {
+		ESP_LOGE(SETUP_TAG, "Failed to initialize mutex\n");
+		while(1) {
+			vTaskDelay(1);
+		};
+	}
+	game_start_mux = xSemaphoreCreateMutex();
+	if (!game_start_mux) {
 		ESP_LOGE(SETUP_TAG, "Failed to initialize mutex\n");
 		while(1) {
 			vTaskDelay(1);
@@ -363,7 +370,7 @@ void setup() {
     pinMode(IF_SENSOR_PIN, INPUT); // Example: Assume sensor pulls LOW when active
 	
     // Attach Interrupts
-    attachInterrupt(digitalPinToInterrupt(IF_SENSOR_PIN), ir_isr, RISING); 
+    attachInterrupt(digitalPinToInterrupt(IF_SENSOR_PIN), ir_isr, RISING);
 	
     ESP_LOGI(SETUP_TAG, "Interrupts attached to pins %d and %d", SOUND_SENSOR_PIN, IF_SENSOR_PIN);
     // --- End Sensor Config ---
@@ -375,28 +382,28 @@ void setup() {
     // ... configure light sleep ...
     #endif
 	// xTaskCreatePinnedToCore(dummy_send_task, "dummy_task", 2048, NULL, 1, NULL, 0);
-	game_start();
 
 	ESP_LOGI(SETUP_TAG, "Creating tasks...");
-    if (xTaskCreatePinnedToCore(sensor_logic_task, "sensor_logic", 2048, NULL, 1, NULL, 0)) { // Core 0
+    if (xTaskCreatePinnedToCore(sensor_logic_task, "sensor_logic", 2048, NULL, 1, &sensor_logic_handle, 0)) { // Core 0
         ESP_LOGE(SETUP_TAG, "Failed to create Sensor Logic Task");
         while(1) {
 			vTaskDelay(1);
 		};
     }
-	if (xTaskCreatePinnedToCore(read_sensor_task, "read_sensor", 2048, NULL, 1, NULL, 0)) { // Core 0
+	if (xTaskCreatePinnedToCore(read_sensor_task, "read_sensor", 2048, NULL, 1, &read_sensor_handle, 0)) { // Core 0
 		ESP_LOGE(SETUP_TAG, "Failed to create Read Sensor Task");
 		while(1) {
 			vTaskDelay(1);
 		};
 	}
-	if (xTaskCreatePinnedToCore(send_packet_task, "send_packet", 2048, NULL, 1, NULL, 1)) { // Core 1
+	if (xTaskCreatePinnedToCore(send_packet_task, "send_packet", 2048, NULL, 1, &send_packet_handle, 1)) { // Core 1
         ESP_LOGE(SETUP_TAG, "Failed to create Send Packet Task");
         while(1) {
 			vTaskDelay(1);
 		};
     }
 
+	game_start();
 	ESP_LOGI(SETUP_TAG,"Client Setup Finished.");
 }
 
